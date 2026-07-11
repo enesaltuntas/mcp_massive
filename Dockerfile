@@ -23,4 +23,7 @@ RUN groupadd --gid 1000 mcp && \
 
 USER mcp
 
+# Used only when MCP_TRANSPORT=sse or streamable-http; stdio needs no port.
+EXPOSE 8000
+
 ENTRYPOINT ["uv", "run", "./entrypoint.py"]

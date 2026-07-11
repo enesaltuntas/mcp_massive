@@ -1,8 +1,11 @@
 import atexit
+import hmac
 import json
 import logging
+import os
 import re
 import ssl
+import sys
 import threading
 from typing import Annotated, Optional, Any, Literal
 from urllib.parse import unquote, urlparse, parse_qs
@@ -39,8 +42,14 @@ _func_index: FunctionIndex | None = None
 _store: DataFrameStore | None = None
 _http_client: httpx.AsyncClient | None = None
 
+# FastMCP passes host/port into its Settings as explicit kwargs, which take
+# priority over FASTMCP_* env vars — so env-based overrides must be resolved
+# here and handed to the constructor.  Needed for HTTP transports in Docker,
+# where binding 127.0.0.1 makes the server unreachable through port mappings.
 mass_mcp = FastMCP(
     "Massive Financial Data",
+    host=os.environ.get("FASTMCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("FASTMCP_PORT", "8000")),
     instructions=(
         "ALWAYS use this server's tools when the user asks about stock prices, "
         "market data, financial data, tickers, options, trades, quotes, aggregates, "
@@ -528,6 +537,48 @@ async def query_data(
         return f"Error: {e}"
 
 
+class _BearerAuthMiddleware:
+    """Require a static Bearer token on every HTTP request.
+
+    Pure ASGI (not Starlette's BaseHTTPMiddleware) so SSE/streamable
+    responses stream through without buffering.  Non-HTTP scopes
+    (lifespan) pass through untouched.
+    """
+
+    def __init__(self, app: Any, token: str) -> None:
+        self._app = app
+        self._expected = f"Bearer {token}".encode()
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        auth = b""
+        for name, value in scope.get("headers") or []:
+            if name.lower() == b"authorization":
+                auth = value
+                break
+        if not hmac.compare_digest(auth, self._expected):
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"www-authenticate", b"Bearer"),
+                    ],
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b'{"error":"unauthorized"}',
+                }
+            )
+            return
+        await self._app(scope, receive, send)
+
+
 def run(transport: Literal["stdio", "sse", "streamable-http"] = "stdio") -> None:
     """Run the Massive MCP server.
 
@@ -535,5 +586,32 @@ def run(transport: Literal["stdio", "sse", "streamable-http"] = "stdio") -> None
     ``_get_index()``) so the MCP protocol can start responding to
     ``initialize`` immediately without waiting for all doc pages to be
     fetched.
+
+    For HTTP transports, setting MCP_AUTH_TOKEN requires clients to send
+    ``Authorization: Bearer <token>``; unset keeps the server open (a
+    warning is printed).  stdio ignores the token — access is already
+    limited to whoever spawned the process.
     """
+    token = os.environ.get("MCP_AUTH_TOKEN", "")
+    if transport in ("sse", "streamable-http"):
+        if token:
+            import uvicorn
+
+            app = (
+                mass_mcp.streamable_http_app()
+                if transport == "streamable-http"
+                else mass_mcp.sse_app()
+            )
+            uvicorn.run(
+                _BearerAuthMiddleware(app, token),
+                host=mass_mcp.settings.host,
+                port=mass_mcp.settings.port,
+                log_level=mass_mcp.settings.log_level.lower(),
+            )
+            return
+        print(
+            "Warning: MCP_AUTH_TOKEN is not set — the HTTP endpoint accepts "
+            "unauthenticated requests from anyone who can reach it.",
+            file=sys.stderr,
+        )
     mass_mcp.run(transport)
